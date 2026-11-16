@@ -1,4 +1,4 @@
-# FNF Sprite Studio
+# UNIVERSAL: FNF Sprite Studio
 
 Extract, align, preview and export Friday Night Funkin' character sprites —
 including native `.RCHR` archive support compatible with the R-Slice engine.
