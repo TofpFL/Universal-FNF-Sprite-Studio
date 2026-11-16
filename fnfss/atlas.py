@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,7 @@ class SheetFrame:
     h: int
     offset_x: int             # placement on the shared canvas
     offset_y: int
+    name: str = ""            # atlas frame name (<prefix><index>)
 
 
 @dataclass
@@ -82,7 +84,8 @@ def pack_sheet(animations: list[Animation], padding: int = 2,
         sheet.paste(img, (px, py), img)
         frames.append(SheetFrame(anim=a.name, index=i, x=px, y=py,
                                  w=img.width, h=img.height,
-                                 offset_x=0, offset_y=0))
+                                 offset_x=0, offset_y=0,
+                                 name=f"{_anim_prefix(a)}{i}"))
     return Sheet(sheet, frames, total_w, total_h, padding)
 
 
@@ -90,16 +93,21 @@ def write_png(sheet: Sheet, path: PathLike) -> None:
     sheet.image.save(path, "PNG", optimize=True)
 
 
-def write_xml(sheet: Sheet, path: PathLike, image_name: str) -> None:
+def _xml_text(sheet: Sheet, image_name: str) -> str:
     """Sparrow/Starling atlas XML - the format Psych Engine consumes."""
     lines = ['<?xml version="1.0" encoding="utf-8"?>',
              '<TextureAtlas imageFile="%s">' % escape(image_name)]
     for f in sheet.frames:
+        name = f.name or f"{f.anim}_{f.index}"
         lines.append(
-            '  <SubTexture name="%s_%d" x="%d" y="%d" width="%d" height="%d"/>'
-            % (escape(f.anim), f.index, f.x, f.y, f.w, f.h))
+            '  <SubTexture name="%s" x="%d" y="%d" width="%d" height="%d"/>'
+            % (escape(name), f.x, f.y, f.w, f.h))
     lines.append("</TextureAtlas>")
-    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines) + "\n"
+
+
+def write_xml(sheet: Sheet, path: PathLike, image_name: str) -> None:
+    Path(path).write_text(_xml_text(sheet, image_name), encoding="utf-8")
 
 
 # ------------------------------------------------------------------ JSON --
@@ -108,35 +116,73 @@ def _clean_name(s: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in s).strip("-").lower() or "anim"
 
 
-def export_psych_json(animations: list[Animation], char_name: str) -> dict:
-    """Psych Engine character JSON (animations block).
+def _asset_key(char_name: str) -> str:
+    """Filesystem/engine-safe key for the atlas files and assetPath."""
+    return re.sub(r"[^A-Za-z0-9]+", "-", char_name).strip("-").lower() or "character"
 
-    Schema follows Psych's characters/*.json: each animation has a name,
-    frame prefix, animType (loop/once), fps, frameIndices into the prefix
-    strip, and a shared [x, y] offset in source pixels.
+
+def _anim_prefix(a: Animation) -> str:
+    return a.prefix or _clean_name(a.name)
+
+
+_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _engine_anim_name(name: str) -> str:
+    """Maps an imported animation name onto the names the R-Slice/Psych
+    engine triggers on (idle, singLEFT/RIGHT/UP/DOWN, *miss, danceLeft/Right).
+    Names that already match or are unrecognized pass through unchanged."""
+    toks = [t.lower() for t in _TOKEN_RE.findall(name)]
+    low = name.lower()
+    direction = next((d for d in ("left", "right", "down", "up") if d in toks), None)
+    if direction is None:
+        direction = next((d for d in ("left", "right", "down", "up")
+                          if re.search(rf"(?<![a-z]){d}(?![a-z])", low)), None)
+    if direction is None:
+        direction = next((d for d in ("left", "right", "down", "up") if d in low), None)
+    is_miss = "miss" in toks or "miss" in low
+    if "dance" in low:
+        if direction in ("left", "right"):
+            return "dance" + direction.capitalize()
+        return name
+    if "idle" in toks or "idle" in low:
+        return "idle"
+    if direction:
+        return f"sing{direction.upper()}{'miss' if is_miss else ''}"
+    return name
+
+
+def export_psych_json(animations: list[Animation], char_name: str) -> dict:
+    """Character JSON in the schema the R-Slice/Psych engine parses.
+
+    The engine's parser (psych.cpp parseCharacter) takes the "assetPath"
+    branch: top-level assetPath/scale/offsets/healthIcon plus an
+    animations array of {name, prefix, frameRate, looped, frameIndices,
+    offsets}. Atlas frames must be named "<prefix><index>" - pack_sheet
+    already names them that way.
     """
     anims = []
     for a in animations:
         if not a.frames:
             continue
         gifproc.align(a)
-        prefix = a.prefix or _clean_name(a.name)
         # Engine anim offset = workspace position of the shared anchor.
         # Per-frame user offsets are already baked into the sheet pixels.
         anims.append({
-            "name": a.name,
-            "prefix": prefix,
-            "animType": "loop" if a.loop else "once",
-            "fps": a.fps,
+            "name": _engine_anim_name(a.name),
+            "prefix": _anim_prefix(a),
+            "frameRate": a.fps,
+            "looped": a.loop,
             "frameIndices": a.selected_indices,
             "offsets": [round(a.pos_x, 2), round(a.pos_y, 2)],
-            "offset": [round(a.pos_x, 2), round(a.pos_y, 2)],
-            "frameCount": len(a.selected_indices),
         })
+    key = _asset_key(char_name)
     return {
-        "character": char_name,
-        "format": "psych-character",
-        "version": "1.0",
+        "assetPath": key,
+        "scale": 1.0,
+        "offsets": [0, 0],
+        "cameraOffsets": [0, 0],
+        "healthIcon": {"id": key},
         "animations": anims,
     }
 
@@ -223,34 +269,27 @@ def pack_character_rchr(animations: list[Animation], out_path: PathLike,
                         char_name: str) -> dict:
     """Builds a .rchr archive containing the exported character files.
 
-    Layout mirrors engine character packs:
-        characters/<name>.json
-        characters/<name>.png   (atlas)
-        characters/<name>.xml   (atlas metadata)
+    Layout mirrors what the R-Slice engine resolves (scene.cpp
+    GraphicCache::atlas + play_psych.cpp makeCharacter):
+        characters/<name>.json   (character def, looked up by characterName)
+        images/<key>.png         (atlas - assetPath points here)
+        images/<key>.xml         (Sparrow atlas metadata)
     """
     from . import rchr
-    import io, tempfile, os
+    import io
 
     char_name = char_name or "character"
+    key = _asset_key(char_name)
     sheet = pack_sheet(animations)
 
     files: list[tuple[str, bytes]] = []
     buf = io.BytesIO()
     sheet.image.save(buf, "PNG", optimize=True)
-    files.append((f"characters/{char_name}.png", buf.getvalue()))
-
-    buf = io.BytesIO()
-    # XML as text
-    import xml.sax.saxutils as _sx
-    lines = ['<?xml version="1.0" encoding="utf-8"?>',
-             f'<TextureAtlas imageFile="{char_name}.png">']
-    for f in sheet.frames:
-        lines.append('  <SubTexture name="%s_%d" x="%d" y="%d" width="%d" height="%d"/>'
-                     % (_sx.escape(f.anim), f.index, f.x, f.y, f.w, f.h))
-    lines.append("</TextureAtlas>")
-    files.append((f"characters/{char_name}.xml", ("\n".join(lines) + "\n").encode("utf-8")))
-
+    files.append((f"images/{key}.png", buf.getvalue()))
+    files.append((f"images/{key}.xml",
+                  _xml_text(sheet, f"{key}.png").encode("utf-8")))
     files.append((f"characters/{char_name}.json",
-                  json.dumps(export_psych_json(animations, char_name), indent=2).encode("utf-8")))
+                  json.dumps(export_psych_json(animations, char_name),
+                             indent=2).encode("utf-8")))
 
     return rchr.pack(out_path, files)
