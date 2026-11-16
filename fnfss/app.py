@@ -308,12 +308,12 @@ class Viewport(QWidget):
                 p.drawLine(QPointF(ax - r, ay), QPointF(ax + r, ay))
                 p.drawLine(QPointF(ax, ay - r), QPointF(ax, ay + r))
 
-        p.setTransform(self.transform())  # back to screen space for gizmo
+        p.resetTransform()  # back to screen space for gizmo
 
         # selection outline (world space) + gizmo (screen space)
         if sel_anim is not None:
             self._draw_selection_rect(p, sel_anim)
-            p.setTransform(self.transform())
+            p.resetTransform()
             self._draw_gizmo(p, sel_anim)
         p.end()
 
