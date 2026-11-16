@@ -159,9 +159,13 @@ def _guess_prefix(name: str) -> str:
 def align(anim: Animation, padding: int = 4) -> Animation:
     """Computes the shared anchor and per-frame placements.
 
-    anchor = centre of the union of every frame's *source-space* bbox,
-    nudged by offset_x/offset_y. Each frame's trimmed image is placed so its
-    bbox centre sits on the anchor. Canvas grows to fit every placement.
+    Frames already live in one shared source coordinate space (the GIF's
+    logical screen), so each frame keeps its NATIVE position relative to
+    the union of all content bboxes - we never re-centre frames
+    independently, which is what caused playback jitter. The anchor is the
+    union bbox centre nudged by offset_x/offset_y; it is a reference point
+    for the workspace/export, not a per-frame target. Canvas grows to fit
+    every (native position + user offset) placement.
     """
     if not anim.frames:
         return anim
@@ -175,22 +179,22 @@ def align(anim: Animation, padding: int = 4) -> Animation:
     anchor_y = (uy0 + uy1) / 2.0 + anim.offset_y
     anim.anchor = (anchor_x, anchor_y)
 
-    # Largest manual frame nudge - canvas grows so user offsets can't clip.
-    margin = 2 + int(max([0.0] + [max(abs(f.user_dx), abs(f.user_dy))
-                                 for f in anim.frames]))
+    # Manual frame nudges are for jitter correction, not teleporting -
+    # clamp them so the shared canvas can't grow without bound (a huge
+    # offset would try to allocate an enormous RGBA canvas).
+    MAX_USER_OFFSET = 1024.0
 
     base = []
     finals = []
     min_x = min_y = 1 << 30
     max_x = max_y = 0
     for f in anim.frames:
-        cx = (f.bbox[0] + f.bbox[2]) / 2.0
-        cy = (f.bbox[1] + f.bbox[3]) / 2.0
-        # top-left of trimmed image relative to the anchor
-        x = anchor_x - (cx - f.bbox[0])
-        y = anchor_y - (cy - f.bbox[1])
-        bx, by = int(round(x)), int(round(y))
-        fx, fy = bx + int(round(f.user_dx)), by + int(round(f.user_dy))
+        # Native position: the trimmed sprite's offset inside the union
+        # bbox - preserves exactly where the GIF drew this frame.
+        bx, by = f.bbox[0] - ux0, f.bbox[1] - uy0
+        ux = max(-MAX_USER_OFFSET, min(MAX_USER_OFFSET, f.user_dx))
+        uy = max(-MAX_USER_OFFSET, min(MAX_USER_OFFSET, f.user_dy))
+        fx, fy = bx + int(round(ux)), by + int(round(uy))
         base.append((bx, by))
         finals.append((fx, fy))
         min_x = min(min_x, fx)
@@ -199,33 +203,40 @@ def align(anim: Animation, padding: int = 4) -> Animation:
         max_y = max(max_y, fy + f.image.height)
     anim.base_placements = base
 
-    w = max_x - min_x + padding * 2 + margin * 2
-    h = max_y - min_y + padding * 2 + margin * 2
+    w = max_x - min_x + padding * 2
+    h = max_y - min_y + padding * 2
     anim.canvas_size = (int(w), int(h))
     # Anchor position within the final canvas (for workspace transforms).
-    anim.anchor_canvas = (anchor_x - (min_x - padding - margin),
-                          anchor_y - (min_y - padding - margin))
-    anim.placements = [(x - min_x + padding + margin, y - min_y + padding + margin)
+    # Canvas origin corresponds to source coord (min_x - padding, ...).
+    anim.anchor_canvas = (anchor_x - (min_x - padding),
+                          anchor_y - (min_y - padding))
+    anim.placements = [(x - min_x + padding, y - min_y + padding)
                        for x, y in finals]
     return anim
 
 
-def frame_world_topleft(anim: Animation, index: int) -> tuple[float, float]:
-    """World-space top-left of a frame's canvas cell.
+def canvas_world_topleft(anim: Animation) -> tuple[float, float]:
+    """World-space top-left of the animation's shared canvas.
 
     pos_* is where the shared anchor sits in world space; the canvas is
     drawn so its anchor_canvas point lands exactly there.
     """
-    if not anim.placements or index < 0 or index >= len(anim.placements):
-        return (anim.pos_x, anim.pos_y)
     ax, ay = anim.anchor_canvas
+    return (anim.pos_x - ax, anim.pos_y - ay)
+
+
+def frame_sprite_topleft(anim: Animation, index: int) -> tuple[float, float]:
+    """World-space top-left of the frame's *trimmed sprite* image."""
+    if not anim.placements or index < 0 or index >= len(anim.placements):
+        return canvas_world_topleft(anim)
+    cx, cy = canvas_world_topleft(anim)
     x, y = anim.placements[index]
-    return (anim.pos_x - ax + x, anim.pos_y - ay + y)
+    return (cx + x, cy + y)
 
 
 def frame_world_rect(anim: Animation, index: int) -> tuple[float, float, float, float]:
-    """(x, y, w, h) of the frame's canvas cell in world space."""
-    x, y = frame_world_topleft(anim, index)
+    """(x, y, w, h) of the animation's shared canvas cell in world space."""
+    x, y = canvas_world_topleft(anim)
     w, h = anim.canvas_size if anim.canvas_size != (0, 0) else (0, 0)
     return (x, y, float(w), float(h))
 

@@ -71,16 +71,21 @@ def test_world_position_helpers():
     a = gifproc.load_animation("test", "mem", data)
     gifproc.align(a)
     a.pos_x, a.pos_y = 200.0, 150.0
-    x, y, w, h = gifproc.frame_world_rect(a, 0)
-    # anchor world pos must equal pos
+    # anchor world pos must equal pos; sprite sits at canvas offset
     ax, ay = a.pos_x, a.pos_y
     acx, acy = a.anchor_canvas
+    cx, cy = gifproc.canvas_world_topleft(a)
+    assert abs(cx - (ax - acx)) < 1e-6
+    assert abs(cy - (ay - acy)) < 1e-6
+    x, y, w, h = gifproc.frame_world_rect(a, 0)
     px, py = a.placements[0]
-    # frame top-left world = pos - anchor_canvas + placement
-    assert abs(x - (ax - acx + px)) < 1e-6
-    assert abs(y - (ay - acy + py)) < 1e-6
-    # canvas cell size is the shared canvas
+    # canvas cell = shared canvas at world pos of its top-left
+    assert abs(x - cx) < 1e-6 and abs(y - cy) < 1e-6
     assert w == a.canvas_size[0] and h == a.canvas_size[1]
+    # sprite top-left = canvas origin + placement
+    sx, sy = gifproc.frame_sprite_topleft(a, 0)
+    assert abs(sx - (cx + px)) < 1e-6
+    assert abs(sy - (cy + py)) < 1e-6
 
 
 def test_frame_user_offsets_move_placement():
@@ -88,13 +93,13 @@ def test_frame_user_offsets_move_placement():
     a = gifproc.load_animation("test", "mem", data)
     gifproc.align(a)
     a.pos_x, a.pos_y = 50.0, 50.0
-    before = gifproc.frame_world_topleft(a, 0)
-    other_before = gifproc.frame_world_topleft(a, 1)
+    before = gifproc.frame_sprite_topleft(a, 0)
+    other_before = gifproc.frame_sprite_topleft(a, 1)
     a.frames[0].user_dx = 7.0
     a.frames[0].user_dy = -3.0
     gifproc.align(a)
-    after = gifproc.frame_world_topleft(a, 0)
-    other_after = gifproc.frame_world_topleft(a, 1)
+    after = gifproc.frame_sprite_topleft(a, 0)
+    other_after = gifproc.frame_sprite_topleft(a, 1)
     # world position moves by exactly the user offset
     assert abs(after[0] - before[0] - 7.0) < 0.6
     assert abs(after[1] - before[1] + 3.0) < 0.6

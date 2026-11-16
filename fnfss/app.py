@@ -231,6 +231,7 @@ class Viewport(QWidget):
 
     # ------------------------------------------------------------ cache --
     def _frame_image(self, anim: Animation, idx: int) -> QImage:
+        """Trimmed sprite QImage - drawn 1:1 in world units (zoom scales)."""
         rev = self.editor.revision
         if self._cache_rev != rev:
             self._cache.clear()
@@ -238,7 +239,7 @@ class Viewport(QWidget):
         key = (id(anim), idx)
         img = self._cache.get(key)
         if img is None:
-            img = pil_to_qimage(gifproc.render_frame(anim, idx))
+            img = pil_to_qimage(anim.frames[idx].image)
             self._cache[key] = img
         return img
 
@@ -319,7 +320,7 @@ class Viewport(QWidget):
 
     def _draw_selection_rect(self, p: QPainter, a: Animation):
         cam = self.camera
-        idxs = self.editor.draw_indices(a)
+        idxs = self.editor.outline_indices(a)
         if not idxs:
             return
         x0 = y0 = 1e30
@@ -351,6 +352,32 @@ class Viewport(QWidget):
         p.drawEllipse(QPointF(ax, ay + arm), 5, 5)
         p.drawRect(QRectF(ax - 5, ay - 5, 10, 10))
 
+    def _ghost_indices(self, a: Animation) -> list[int]:
+        """Onion-skin frame indices around the playhead.
+
+        Previous ghost is always shown when onion skinning is on; the next
+        ghost is independent. Loops wrap around; non-looping animations
+        show no ghost past the ends.
+        """
+        out = []
+        n = len(a.frames)
+        cur = int(a.cur_frame)
+        if n < 2:
+            return out
+        if self.editor.onion_skin:
+            p = cur - 1
+            if p < 0:
+                p = n - 1 if a.loop else -1
+            if p >= 0:
+                out.append(p)
+        if self.editor.ghost_next:
+            q = cur + 1
+            if q >= n:
+                q = 0 if a.loop else -1
+            if 0 <= q < n:
+                out.append(q)
+        return out
+
     def _draw_anim(self, p: QPainter, ed: "EditorTab", a: Animation,
                    primary_only: bool, alpha: float):
         idxs = ed.draw_indices(a)
@@ -361,29 +388,32 @@ class Viewport(QWidget):
             img = self._frame_image(a, i)
             if img.isNull():
                 continue
-            x, y = gifproc.frame_world_topleft(a, i)
-            w, h = a.canvas_size
-            target = QRectF(x, y, w, h)
+            x, y = gifproc.frame_sprite_topleft(a, i)
+            target = QRectF(x, y, img.width(), img.height())
             if primary_only:
                 p.setOpacity(alpha)
                 p.drawImage(target, img)
                 p.setOpacity(1.0)
             else:
-                # ghost pass: previous frame under the playhead frame
-                primary = ed.primary_frame(a)
-                if ed.ghost and i == a.cur_frame and a.cur_frame > 0:
-                    gimg = self._frame_image(a, a.cur_frame - 1)
-                    if not gimg.isNull():
-                        p.setOpacity(ed.ghost_alpha)
-                        p.drawImage(target, gimg)
+                # selected frames solid, unselected frames of the same
+                # animation faint - the whole stack stays visible
+                lit = i in ed.frame_sel or i == a.cur_frame
+                # onion-skin ghosts under the playhead frame - visual
+                # reference only, never hit-tested or selectable
+                if i == a.cur_frame:
+                    for gidx in self._ghost_indices(a):
+                        gimg = self._frame_image(a, gidx)
+                        if gimg.isNull():
+                            continue
+                        gx, gy = gifproc.frame_sprite_topleft(a, gidx)
+                        p.setOpacity(ed.GHOST_ALPHA)
+                        p.drawImage(QRectF(gx, gy, gimg.width(), gimg.height()), gimg)
                         p.setOpacity(1.0)
-                # ghost pass for non-primary selected frames
-                if i != primary and ed.frame_sel:
-                    p.setOpacity(0.30)
-                    p.drawImage(target, img)
+                if not lit:
+                    p.setOpacity(0.22)
+                p.drawImage(target, img)
+                if not lit:
                     p.setOpacity(1.0)
-                else:
-                    p.drawImage(target, img)
 
     # ------------------------------------------------------------- input --
     def _gizmo_hit(self, sx: float, sy: float, a: Animation) -> str | None:
@@ -397,15 +427,18 @@ class Viewport(QWidget):
             return "center"
         return None
 
-    def _anim_at(self, wx: float, wy: float) -> Animation | None:
+    def _anim_at(self, wx: float, wy: float):
+        """Returns (Animation, frame_index) of the topmost sprite hit."""
         for a in reversed(self.editor.animations):
             for i in self.editor.draw_indices(a):
                 if i < 0 or i >= len(a.frames):
                     continue
-                x, y, w, h = gifproc.frame_world_rect(a, i)
-                if x <= wx <= x + w and y <= wy <= y + h:
-                    return a
-        return None
+                # hit-test the sprite's own rect (canvas is shared)
+                sx, sy = gifproc.frame_sprite_topleft(a, i)
+                iw, ih = a.frames[i].image.size
+                if sx <= wx <= sx + iw and sy <= wy <= sy + ih:
+                    return a, i
+        return None, -1
 
     def mousePressEvent(self, ev):
         ed = self.editor
@@ -424,13 +457,20 @@ class Viewport(QWidget):
                               "start": (a.pos_x, a.pos_y),
                               "moved": False}
                 return
-        hit = self._anim_at(*self.camera.s2w(sx, sy, self.width(), self.height()))
+        hit, hit_idx = self._anim_at(*self.camera.s2w(sx, sy, self.width(), self.height()))
         if hit is not None:
             ed.select_animation(hit)
             a = hit
+            if ed.move_mode == "frames":
+                # clicking a frame in frame-edit mode selects just that frame
+                a.cur_frame = hit_idx
+                ed.frame_sel = {hit_idx}
+                ed.refresh_props()
+                ed.timeline.update()
+                ed.revision += 1
             if ed.move_mode == "frames" and ed.frame_sel:
-                snap = {i: (a.frames[i].user_dx, a.frames[i].user_dy)
-                        for i in ed.frame_sel if i < len(a.frames)}
+                snap = {int(i): (a.frames[int(i)].user_dx, a.frames[int(i)].user_dy)
+                        for i in ed.frame_sel if int(i) < len(a.frames)}
                 self._drag = {"kind": "frames", "anim": a, "sel": set(ed.frame_sel),
                               "start": self.camera.s2w(sx, sy, self.width(), self.height()),
                               "snap": snap, "moved": False}
@@ -476,6 +516,7 @@ class Viewport(QWidget):
             dx, dy = wx - d["start"][0], wy - d["start"][1]
             a = d["anim"]
             for i, (odx, ody) in d["snap"].items():
+                i = int(i)
                 a.frames[i].user_dx = odx + dx
                 a.frames[i].user_dy = ody + dy
             gifproc.align(a)
@@ -522,8 +563,8 @@ class Viewport(QWidget):
 
     def mouseDoubleClickEvent(self, ev):
         pos = ev.position()
-        hit = self._anim_at(*self.camera.s2w(pos.x(), pos.y(),
-                                             self.width(), self.height()))
+        hit, _hi = self._anim_at(*self.camera.s2w(pos.x(), pos.y(),
+                                                  self.width(), self.height()))
         if hit is None:
             self.camera.reset()
             self.editor.refresh_props()
@@ -632,7 +673,8 @@ class Timeline(QWidget):
             return -1
         total = len(a.frames) * self.CELL
         x0 = max(8, (self.width() - total) // 2)
-        i = (x - x0) // self.CELL
+        # ev.position() is float in Qt6 - // yields float; indices must be int
+        i = int((x - x0) // self.CELL)
         return i if 0 <= i < len(a.frames) else -1
 
     def mousePressEvent(self, ev):
@@ -685,9 +727,10 @@ class EditorTab(QWidget):
         self.show_grid = True
         self.show_origin = True
         self.show_anchors = True
-        self.ghost = False
-        self.ghost_alpha = 0.4
-        self.move_mode = "anim"          # "anim" | "frames"
+        self.move_mode = "anim"          # "anim" (Move GIF) | "frames" (Move Frame)
+        self.onion_skin = False          # previous-frame ghost, fixed 50%
+        self.ghost_next = False          # next-frame ghost toggle
+        self.GHOST_ALPHA = 0.5
         self.speed = 1.0
         self._undo: list[_LambdaCmd] = []
         self._redo: list[_LambdaCmd] = []
@@ -858,23 +901,21 @@ class EditorTab(QWidget):
         self.origin_check.setChecked(True)
         self.anchors_check = QCheckBox("anchors")
         self.anchors_check.setChecked(True)
-        self.ghost_check = QCheckBox("ghost previous frame")
-        self.ghost_op = QSlider(Qt.Horizontal)
-        self.ghost_op.setRange(10, 90)
-        self.ghost_op.setValue(40)
+        self.onion_check = QCheckBox("onion skin (prev frame)")
+        self.next_ghost_check = QCheckBox("next frame ghost")
         self.ox_origin = QDoubleSpinBox()
         self.oy_origin = QDoubleSpinBox()
         for s in (self.ox_origin, self.oy_origin):
             s.setRange(-100000, 100000)
             s.setSingleStep(1)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["move: animation", "move: frames"])
+        self.mode_combo.addItems(["Move GIF", "Move Frame"])
         fv.addRow("Zoom", self.zoom_label)
         fv.addRow(self.grid_check)
         fv.addRow(self.origin_check)
         fv.addRow(self.anchors_check)
-        fv.addRow(self.ghost_check)
-        fv.addRow("ghost α", self.ghost_op)
+        fv.addRow(self.onion_check)
+        fv.addRow(self.next_ghost_check)
         fv.addRow("origin X", self.ox_origin)
         fv.addRow("origin Y", self.oy_origin)
         fv.addRow(self.mode_combo)
@@ -885,8 +926,8 @@ class EditorTab(QWidget):
         self.grid_check.stateChanged.connect(lambda s: setattr(self, "show_grid", bool(s)) or self.viewport.update())
         self.origin_check.stateChanged.connect(lambda s: setattr(self, "show_origin", bool(s)) or self.viewport.update())
         self.anchors_check.stateChanged.connect(lambda s: setattr(self, "show_anchors", bool(s)) or self.viewport.update())
-        self.ghost_check.stateChanged.connect(self._ghost_toggled)
-        self.ghost_op.valueChanged.connect(self._ghost_op_changed)
+        self.onion_check.stateChanged.connect(self._onion_toggled)
+        self.next_ghost_check.stateChanged.connect(self._next_ghost_toggled)
         self.ox_origin.valueChanged.connect(lambda v: self._set_origin(v, self.origin[1]))
         self.oy_origin.valueChanged.connect(lambda v: self._set_origin(self.origin[0], v))
         self.mode_combo.currentIndexChanged.connect(
@@ -911,7 +952,11 @@ class EditorTab(QWidget):
 
     def current_anim(self) -> Animation | None:
         if 0 <= self.sel < len(self.animations):
-            return self.animations[self.sel]
+            a = self.animations[self.sel]
+            # indices must be ints - a float here once crashed every paint
+            if a.frames:
+                a.cur_frame = int(a.cur_frame) % len(a.frames)
+            return a
         return None
 
     def select_animation(self, a: Animation):
@@ -926,16 +971,22 @@ class EditorTab(QWidget):
         self.viewport.update()
 
     def draw_indices(self, a: Animation) -> list[int]:
-        """Frame indices the viewport should draw for `a`."""
-        if a is self.current_anim() and self.move_mode == "frames" and self.frame_sel:
-            sel = set(self.frame_sel) | {a.cur_frame}  # playhead always visible
-            return sorted(i for i in sel if 0 <= i < len(a.frames))
-        return [a.cur_frame] if a.frames else []
+        """Frame indices the viewport should draw for `a`.
 
-    def primary_frame(self, a: Animation) -> int:
-        if a.cur_frame in self.frame_sel:
-            return a.cur_frame
-        return min(self.frame_sel) if self.frame_sel else a.cur_frame
+        In frame-edit mode the WHOLE animation stays visible - selected
+        frames draw solid, the rest draw faint - so you can always see
+        what you're aligning against.
+        """
+        if a.frames and a is self.current_anim() and self.move_mode == "frames":
+            return list(range(len(a.frames)))
+        return [int(a.cur_frame)] if a.frames else []
+
+    def outline_indices(self, a: Animation) -> list[int]:
+        """Frames that get the selection outline (selected + playhead)."""
+        if a is self.current_anim() and self.move_mode == "frames":
+            sel = {int(i) for i in self.frame_sel} | {int(a.cur_frame)}
+            return sorted(i for i in sel if 0 <= i < len(a.frames))
+        return [int(a.cur_frame)] if a.frames else []
 
     # ------------------------------------------------------------- undo --
     def push_cmd(self, text: str, undo, redo):
@@ -964,6 +1015,7 @@ class EditorTab(QWidget):
     def _restore_frame_offsets(self, a: Animation, snap: dict):
         changed = False
         for i, (dx, dy) in snap.items():
+            i = int(i)
             if 0 <= i < len(a.frames):
                 a.frames[i].user_dx, a.frames[i].user_dy = dx, dy
                 changed = True
@@ -1009,7 +1061,7 @@ class EditorTab(QWidget):
         a = self.current_anim()
         if a is None or not self.frame_sel:
             return
-        idxs = sorted(i for i in self.frame_sel if i < len(a.frames))
+        idxs = sorted(int(i) for i in self.frame_sel if int(i) < len(a.frames))
         if not idxs:
             return
         # snapshot old values, apply new where different
@@ -1067,7 +1119,7 @@ class EditorTab(QWidget):
         a = self.current_anim()
         if a is None or not self.frame_sel:
             return
-        idxs = [i for i in self.frame_sel if i < len(a.frames)]
+        idxs = [int(i) for i in self.frame_sel if int(i) < len(a.frames)]
         old = {i: (a.frames[i].user_dx, a.frames[i].user_dy) for i in idxs}
         new = {i: (0.0, 0.0) for i in idxs}
         self._restore_frame_offsets(a, new)
@@ -1080,7 +1132,8 @@ class EditorTab(QWidget):
         if a is None or a.cur_frame >= len(a.frames):
             return
         src = a.frames[a.cur_frame]
-        idxs = [i for i in self.frame_sel if i < len(a.frames) and i != a.cur_frame]
+        idxs = [int(i) for i in self.frame_sel
+                if int(i) < len(a.frames) and int(i) != a.cur_frame]
         if not idxs:
             return
         old = {i: (a.frames[i].user_dx, a.frames[i].user_dy) for i in idxs}
@@ -1103,12 +1156,12 @@ class EditorTab(QWidget):
                       lambda: self._restore_frame_offsets(a, new))
 
     # -------------------------------------------------------- view opts --
-    def _ghost_toggled(self, on):
-        self.ghost = bool(on)
+    def _onion_toggled(self, on):
+        self.onion_skin = bool(on)
         self.viewport.update()
 
-    def _ghost_op_changed(self, v):
-        self.ghost_alpha = v / 100.0
+    def _next_ghost_toggled(self, on):
+        self.ghost_next = bool(on)
         self.viewport.update()
 
     def _set_origin(self, x, y):
@@ -1150,7 +1203,7 @@ class EditorTab(QWidget):
                 if acc < dur:
                     break
                 acc -= dur
-                a.cur_frame = (a.cur_frame + 1) % len(a.frames)
+                a.cur_frame = int((a.cur_frame + 1) % len(a.frames))
                 if not a.loop and a.cur_frame == 0:
                     break
             a._acc = acc
@@ -1221,7 +1274,7 @@ class EditorTab(QWidget):
             self.anchor_label.setText(
                 f"({a.anchor[0]:.1f}, {a.anchor[1]:.1f})")
             if a.cur_frame < len(a.frames):
-                ex, ey = gifproc.frame_world_topleft(a, a.cur_frame)
+                ex, ey = gifproc.frame_sprite_topleft(a, a.cur_frame)
                 self.eff_label.setText(f"({ex:.1f}, {ey:.1f})")
             self.name_edit.setText(a.name)
             self.prefix_edit.setText(a.prefix)
@@ -1252,7 +1305,7 @@ class EditorTab(QWidget):
         self.oy_origin.blockSignals(False)
 
     def _fill_frame_fields(self, a: Animation):
-        idxs = [i for i in self.frame_sel if i < len(a.frames)]
+        idxs = [int(i) for i in self.frame_sel if int(i) < len(a.frames)]
         if not idxs:
             self.frame_info.setText("no frame")
             return
