@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win-x64
+            artifact: FNF-Sprite-Studio-windows-x64.exe
+          - os: windows-11-arm
+            target: win-arm64
+            artifact: FNF-Sprite-Studio-windows-arm64.exe
+          - os: ubuntu-22.04
+            target: linux-x64
+            artifact: FNF-Sprite-Studio-linux-x64
+          - os: macos-latest
+            target: macos-arm64
+            artifact: FNF-Sprite-Studio-macos-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --noconfirm --clean sprite_studio.spec
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: pyinstaller --noconfirm --clean sprite_studio.spec
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist/pkg
+          if [ "${{ matrix.target }}" = "linux-x64" ]; then
+            tar -czf "dist/pkg/${{ matrix.artifact }}.tar.gz" -C dist FNF-Sprite-Studio
+          elif [ "${{ matrix.target }}" = "macos-arm64" ]; then
+            tar -czf "dist/pkg/${{ matrix.artifact }}.tar.gz" -C dist FNF-Sprite-Studio.app 2>/dev/null || tar -czf "dist/pkg/${{ matrix.artifact }}.tar.gz" -C dist FNF-Sprite-Studio
+          else
+            cp "dist/FNF-Sprite-Studio.exe" "dist/pkg/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/pkg/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
