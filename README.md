@@ -12,6 +12,9 @@ python -m fnfss
 
 Or double-click `run.bat`.
 
+**New here? Read [TUTORIAL.md](TUTORIAL.md) — a full walkthrough from
+importing GIFs to exporting engine-ready packs.**
+
 ## Features
 
 - **Import tab** — paste a Funkipedia (Fandom) character URL to discover
